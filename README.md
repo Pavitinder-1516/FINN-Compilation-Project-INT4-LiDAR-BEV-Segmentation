@@ -44,6 +44,38 @@ KITTI LiDAR (.bin)
    Bitstream → Zybo Z7-10 FPGA
 ```
 
+### 2.1 The three "worlds" of this project
+
+```
+                         PROJECT
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+     WORLD 1              WORLD 2             WORLD 3
+   Data / Python      Neural Network         FPGA / FINN
+        │                   │                   │
+        ▼                   ▼                   ▼
+  KITTI LiDAR          TinyUNetQ            QONNX / ONNX
+        │                   │                   │
+        ▼                   ▼                   ▼
+   BEV Generator      Brevitas QAT             FINN
+        │              (INT8 / INT4)             │
+        ▼                   │                   ▼
+   BEV Tensor               ▼              HLS / RTL build
+  (3×300×300) ────────► ONNX Export ─────────►   │
+                                                  ▼
+                                               Vivado
+                                                  │
+                                                  ▼
+                                             Bitstream
+                                                  │
+                                                  ▼
+                                          Zybo Z7-10 FPGA
+```
+
+Each "world" has its own tools and its own kind of debugging — keeping them
+separate prevents chasing a bug in the wrong layer.
+
 ---
 
 ## 3. Dataset — KITTI
@@ -95,6 +127,53 @@ Key settings:
 | Weight bit-width | 4 (`Int4WeightPerTensorFloatDecoupled`) |
 | Activation bit-width | 4/8 (`Int8ActPerTensorFixedPoint`) |
 | Framework | PyTorch + Brevitas |
+
+### 4.1 TinyUNetQ architecture flow (skip connections removed)
+
+```
+Input  (3 × 300 × 300)
+        │
+        ▼
+  QuantIdentity  (input quant, 4-bit)
+        │
+        ▼
+┌────────────────────┐
+│ Encoder Block 1 (e1)│  Conv(3→16) → ReLU → Conv(16→16) → ReLU
+└──────────┬──────────┘
+           ▼
+      MaxPool2d (p1)
+           │
+           ▼
+┌────────────────────┐
+│ Encoder Block 2 (e2)│  Conv(16→32) → ReLU → Conv(32→32) → ReLU
+└──────────┬──────────┘
+           ▼
+      MaxPool2d (p2)
+           │
+           ▼
+┌────────────────────┐
+│   Bottleneck (b)    │  Conv(32→64) → ReLU → Conv(64→64) → ReLU
+└──────────┬──────────┘
+           ▼
+ ConvTranspose2d u2 (64→32)
+           │
+           ▼             ✗ torch.cat([d2, e2])  REMOVED for FINN
+┌────────────────────┐
+│ Decoder Block 2 (d2)│  Conv(32→32) → ReLU
+└──────────┬──────────┘
+           ▼
+ ConvTranspose2d u1 (32→16)
+           │
+           ▼             ✗ torch.cat([d1, e1])  REMOVED for FINN
+┌────────────────────┐
+│ Decoder Block 1 (d1)│  Conv(16→16) → ReLU
+└──────────┬──────────┘
+           ▼
+   QuantConv2d out (16→1, 1×1)
+           │
+           ▼
+   Output (1 × 300 × 300)
+```
 
 **FINN-compatibility change:** skip connections (`torch.cat([...])` between
 encoder and decoder blocks) were **removed**, and the corresponding decoder
@@ -206,7 +285,35 @@ Then you can safely close the Ubuntu VM / VirtualBox window.
 **You do NOT need to repeat:** Ubuntu install, Docker install, FINN image
 pull, FINN clone, or `fetch-repos.sh`. Those are one-time steps only.
 
-### 7.4 Vivado note
+### 7.4 Startup workflow (visual)
+
+```
+ Windows (host)
+      │
+      ▼
+ VirtualBox 7.2.14
+      │
+      ▼
+ Ubuntu VM   ── one-time only: Docker install, FINN clone, fetch-repos.sh
+      │
+      ▼
+ Terminal →  cd ~/finn_ws/finn
+      │
+      ▼
+ Terminal →  bash run-docker-safe.sh
+      │
+      ▼
+ FINN Docker container
+ root@pavitinder-VirtualBox:/workspace#   ← WORK HAPPENS HERE
+      │
+      ▼
+      exit
+      │
+      ▼
+ Back in Ubuntu → close the VM
+```
+
+### 7.5 Vivado note
 Vivado is installed on **Windows**, not inside the Ubuntu FINN container.
 The FINN guide's early steps (through model conversion / transformation) do
 not require Vivado — it is only needed later, for synthesis, implementation,
@@ -298,6 +405,30 @@ a deviation from the guide's intent.
 | Bitstream generation | ⏸️ Not reached |
 | FPGA testing | ⏸️ Not reached |
 
+### 10.1 Roadmap at a glance
+
+```
+✅ KITTI dataset prepared
+✅ LiDAR → BEV pipeline
+✅ BEV dataset generated (7,481 frames)
+✅ TinyUNetQ (INT4) built & trained
+✅ Skip connections removed (FINN Step 1)
+✅ Model evaluated (old vs new)
+✅ QONNX / ONNX exported
+✅ FINN Docker environment ready
+✅ build.py written (Zybo Z7-10 target)
+        │
+        ▼
+❌ step_qonnx_to_finn   ← CURRENT BLOCKER
+        │
+        ▼
+⏸ HLS synthesis
+⏸ IP stitching
+⏸ Vivado synthesis / implementation
+⏸ Bitstream generation
+⏸ FPGA testing (Zybo Z7-10)
+```
+
 ---
 
 ## 11. Current blocker
@@ -315,6 +446,70 @@ a `Relu` that is configured as **signed and/or narrow-range**, which FINN
 does not support for ReLU activations. FINN expects an **unsigned**
 activation quantizer (the guide's reference example uses
 `Uint8ActPerTensorFixedPoint`) for these positions.
+
+### 11.1 FINN build flow — where the block is
+
+```
+tiny_bev_halo_qat_int4_finn_qonnx.onnx   (47 nodes)
+        │
+        ▼
+[1/17] step_qonnx_to_finn        ❌ FAILS HERE
+        │                          "FINN only supports unsigned and
+        │                           non-narrow Quant nodes for Relu"
+        ▼
+[2/17] step_streamline           ⏸ not reached
+        ▼
+[3/17] step_convert_to_hw        ⏸ not reached
+        ▼
+  ...  folding, HLS codegen,
+       IP stitching, etc.        ⏸ not reached
+        ▼
+[17/17] step_deployment_package  ⏸ not reached
+        │
+        ▼
+   Vivado synthesis / implementation   ⏸ not reached
+        │
+        ▼
+   Bitstream → Zybo Z7-10              ⏸ not reached
+```
+
+### 11.2 Debug decision flow
+
+```
+        Build fails at step_qonnx_to_finn
+                     │
+                     ▼
+     Inspect QONNX graph (Quant + Relu nodes)
+                     │
+                     ▼
+      Find node(s) with signed / narrow Quant
+                     │
+                     ▼
+     Is it feeding a QuantReLU activation?
+          │                        │
+         Yes                       No
+          │                        │
+          ▼                        ▼
+ Switch that activation      Investigate further —
+ quantizer to an UNSIGNED    a different node type
+ quantizer (e.g.             may be causing the
+ Uint8ActPerTensorFixedPoint) error
+          │
+          ▼
+   Re-export QONNX
+          │
+          ▼
+ Re-run step_qonnx_to_finn ONLY
+ (not the full build)
+          │
+          ▼
+      Passes? ──No──► repeat inspection
+          │
+         Yes
+          │
+          ▼
+ Continue to step 2/17 onward
+```
 
 **Current investigation step:** inspect the exported ONNX graph to find the
 exact `Quant`/`Relu` node(s) responsible, before making any changes to the
