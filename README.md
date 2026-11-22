@@ -1,595 +1,170 @@
-# BEV-LiDAR Segmentation → Quantized TinyUNet → FINN → FPGA
+# LiDAR vehicle segmentation on a Zynq FPGA
 
-A low-bit neural-network accelerator project that converts KITTI LiDAR point
-clouds into Bird's-Eye-View (BEV) representations, performs BEV segmentation
-using a quantized TinyUNet model, and uses the FINN compiler to convert the
-INT4 network into an FPGA dataflow accelerator (target board: **Zybo Z7-10**,
-part `xc7z010clg400-1`).
+This project follows a LiDAR frame from point-cloud preprocessing to a vehicle mask captured from a physical Digilent Zybo XC7Z010. It started with point-cloud denoising, progressed to low-precision neural networks for bird’s-eye-view (BEV) segmentation, and produced three hardware designs: a compact dual-model KITTI implementation, individually deployed nuScenes models, and a shared compute engine that can change precision between frames.
 
----
+**Physical result.** The fixed nuScenes INT4 and INT8 designs each processed an unlabeled reference and three real frames on the Zybo. All eight captures matched their respective software references byte for byte across all 65,536 output cells per frame. On the first labeled frame, INT4 achieved 0.4262 IoU and INT8 achieved 0.3911. The other frames illustrate why numerical agreement and detection quality need separate measurements.
 
-## 1. One-line summary
+**Latest engineering result.** A single 16-lane engine implements both larger nuScenes networks. It routed at 35 MHz and reproduced all eight reference outputs in full-frame RTL simulation. Its physical switching test and the frozen-KITTI cross-dataset board test are prepared for user-operated execution.
 
-> We take 3D LiDAR data from a vehicle, turn it into a 2D top-down (BEV)
-> image, run a small quantized AI model on it to detect objects, shrink that
-> model from 32-bit to 4-bit numbers, and use FINN to turn the 4-bit model
-> into custom FPGA hardware instead of running it on a CPU/GPU.
+**Tools and methods:** Python, NumPy, quantization-aware training, QONNX, FINN, HLS, SystemVerilog, Verilator, Vivado, Tcl, JTAG-to-AXI and dual RV32I soft processors.
 
----
+## How a frame reaches the board
 
-## 2. Pipeline overview
-
-```
-KITTI LiDAR (.bin)
-        │
-        ▼
-   BEV Generation  (3 × 300 × 300 tensor)
-        │
-        ▼
- Quantized TinyUNetQ (Brevitas, INT4 weights / INT8 activations)
-        │
-        ▼
-      QONNX / ONNX export
-        │
-        ▼
-       FINN  (Docker, Ubuntu VM)
-        │
-        ▼
- FINN Dataflow Architecture (HLS / RTL)
-        │
-        ▼
-     Vivado (synthesis + implementation)
-        │
-        ▼
-   Bitstream → Zybo Z7-10 FPGA
+```mermaid
+flowchart LR
+    A["Recorded LiDAR points"] --> B["Laptop: calibrate, crop and rasterize"]
+    B --> C["Density, height and edge channels"]
+    C --> D["Quantize and pack for the selected model"]
+    D --> E["USB / JTAG to AXI"]
+    E --> F["Zybo programmable logic: neural inference"]
+    F --> G["Read back output words"]
+    G --> H["Compare raw capture with integer reference"]
+    G --> I["Threshold output and score against labels"]
+    H --> J["Saved verification report"]
+    I --> J
 ```
 
-### 2.1 The three "worlds" of this project
+The host prepares and transfers a recorded frame. The programmable logic computes the neural output. On the RISC-V builds, the control firmware also runs inside programmable logic. The laptop reconstructs the image, runs the independent checks and displays results. This setup measures correctness with a replayable input. End-to-end JTAG time includes host and transport overhead.
 
-```
-                         PROJECT
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-     WORLD 1              WORLD 2             WORLD 3
-   Data / Python      Neural Network         FPGA / FINN
-        │                   │                   │
-        ▼                   ▼                   ▼
-  KITTI LiDAR          TinyUNetQ            QONNX / ONNX
-        │                   │                   │
-        ▼                   ▼                   ▼
-   BEV Generator      Brevitas QAT             FINN
-        │              (INT8 / INT4)             │
-        ▼                   │                   ▼
-   BEV Tensor               ▼              HLS / RTL build
-  (3×300×300) ────────► ONNX Export ─────────►   │
-                                                  ▼
-                                               Vivado
-                                                  │
-                                                  ▼
-                                             Bitstream
-                                                  │
-                                                  ▼
-                                          Zybo Z7-10 FPGA
-```
+## 1. From point sensing to vehicle footprints
 
-Each "world" has its own tools and its own kind of debugging — keeping them
-separate prevents chasing a bug in the wrong layer.
+Early project records describe three experiments that informed the later design. A one-dimensional convolutional autoencoder reconstructed normalized planar LiDAR scans using mean-squared error. Rotation augmentation, shape classification and pointwise wall/corner labeling explored whether geometry survived denoising. A radar-to-LiDAR teacher–student experiment investigated coordinate alignment and used a two-metre temporal centroid gate to suppress transient detections. These are historical exploratory stages. The physical results below begin with the BEV pipeline.
 
----
+BEV turns irregular returns into a fixed grid in vehicle coordinates. Each cell accumulates point density, height and a local edge feature. A convolutional model predicts vehicle occupancy per cell. This choice makes the tensor size, memory layout, spatial coverage and hardware/software comparison explicit.
 
-## 3. Dataset — KITTI
+## 2. Compact KITTI model and first FPGA implementation
 
-```
-training/
-    image_2/     → camera images
-    label_2/     → object annotations
-    velodyne/    → LiDAR point clouds (.bin)  ← primary input
-testing/
-    image_2/
-    velodyne/
-```
+The KITTI pipeline used a 128 × 128 grid covering 60 m forward and 30 m on either side. The original target represented vehicle footprints for Car, Van and Truck. The training record describes a frame-level split of 5,236 training, 1,122 validation and 1,123 test frames, with Adam and weighted binary cross-entropy plus Dice loss. Separate INT4 and INT8 networks contained 2,614 parameters each. Their saved operating thresholds were 0.7 and 0.4, respectively.
 
-LiDAR points (`x, y, z, intensity`) are filtered and projected onto an XY
-grid to produce a **multi-channel BEV tensor**:
+The selected release, `selected_001`, used a FINN native-RTL implementation. The manual image let the host select either network. The adaptive image added two programmable-logic RISC-V harts for control. Both contained the compact network pair. Saved routed reports at 50 MHz show the hardware cost of these two configurations.
 
-- Channel 0 → occupancy / density
-- Channel 1 → height-related information
-- Channel 2 → additional BEV information
+| KITTI image | LUTs | Flip-flops | BRAM36 equivalents | DSPs | Setup slack |
+|---|---:|---:|---:|---:|---:|
+| Manual | 9,219 | 13,664 | 55.5 | 46 | +7.910 ns |
+| Adaptive | 12,834 | 15,243 | 57.5 | 46 | +0.655 ns |
 
-Input tensor shape: `3 × 300 × 300`.
+The historical integer decision check found zero changed **valid mask cells** over 1,123 held-out frames per precision. Three archived real-frame board masks independently matched their references. An archived adaptive empty-frame capture differed by 83 bits across 36 words despite a passing scalar log. Its provenance remains unresolved. This discrepancy motivated keeping raw captures alongside summary metrics.
 
-Approximately **7,481 frames** were exported from KITTI into the BEV
-dataset. Example sanity-check output from the pipeline:
+## 3. Moving to nuScenes
 
-```
-sample 001736
-x2 shape: (2, 300, 300)
-x[min,max]: 0.0 1.0
-y shape: (300, 300)
-y sum: 176
+Two nuScenes branches answered different questions.
+
+| Branch | Input and network | Training or selection outcome |
+|---|---|---|
+| Local footprint experiments | 128 × 128, 9,830-parameter final compact model | An early INT8 baseline reached about 0.183 validation IoU. A context-enhanced trial reached 0.247849. Subsequent teacher–student and quantization-aware experiments recorded held-out IoU of 0.289105 for INT8 and 0.268498 for INT4. |
+| Team-supplied StreamBEVNetQ, deployed on Zybo | 256 × 256, 86,284 parameters, 11 convolutions, two pooling stages and two nearest-neighbour upsampling stages | Existing trained INT4 and INT8 weights and QONNX exports were frozen for compilation. The package records 8,095 training, 1,034 validation and 991 test frames. |
+
+The deployed branch predicts **LiDAR-hit vehicle regions**. The preprocessing rotates sensor points into ego-aligned axes, retains a sensor-centred origin, removes ego returns and crops to 51.2 m forward and ±25.6 m laterally. Each 0.2 m cell stores clipped point count divided by eight, normalized maximum height and a Sobel edge magnitude normalized using the 99.5th percentile. Car and truck returns inside annotated boxes form the core. A two-cell dilation forms a halo. The encoded labels are background 0, halo 1 and core 2.
+
+The original KITTI footprint task and nuScenes hit-region task have different targets. Their native IoUs describe their respective experiments. A separate aligned protocol below addresses transfer across datasets.
+
+## 4. Numerical contract and compiler engineering
+
+For the deployed nuScenes models, INT4 and INT8 identify hidden precision. Both receive signed-byte inputs. The host computes `clip(round_to_even(x × 128), −128, 127)`, converts channel-first tensors to pixel-interleaved NHWC order, and packs four successive bytes per little-endian word. One frame contains **196,608 input bytes** and **65,536 signed output bytes**. The output scale is 0.125. The frozen decisions mark output codes ≥ 4 positive for INT4 and ≥ 1 for INT8.
+
+```mermaid
+flowchart TD
+    A["Frozen weights, QONNX graph and reference tensors"] --> B["Convert and streamline quantized graph"]
+    B --> C["Check outputs at intermediate graphs"]
+    C --> D["Partition streaming operators and specialize widths"]
+    D --> E["Generate FINN RTL and HLS operators"]
+    E --> F["Compress thresholds, bank weights and replace oversized upsamplers"]
+    F --> G["Integrate queues, AXI registers and PL firmware"]
+    G --> H["Synthesize, place, route and review timing"]
+    H --> I["Program fixed model and compare physical capture"]
 ```
 
----
+- Saved-reference checks recorded zero output difference through conversion and streamlining for both networks. Intermediate graphs helped isolate conversion errors from later integration failures.
+- Uniform, power-of-two-spaced thresholds allowed exact subtraction, shifting and saturation. The irregular final INT4 head retained its table. Arithmetic checks covered 427,192 selected values; 21 layer-specific stream tests exercised thresholds, resets and stalls.
+- The implementation combined FINN RTL with HLS-generated operators. Repairs addressed generated stream port names, HLS version compatibility, width conversion and IP packaging. Bounded upsampling and banked weight storage reduced memory pressure.
+- The larger nuScenes networks exceeded the device budget when instantiated together in the first design. Separate 50 MHz images made it possible to validate each full network physically before designing the shared engine.
+- Each fixed image included two RV32I harts, firmware, software interrupts, telemetry and JTAG-readable registers. The controller reported a precision recommendation while the programmed model stayed fixed. A saved INT4 reference run reported both harts booted, three interrupts at capture time and last interrupt latency of 21 cycles.
 
-## 4. Model — TinyUNetQ (Brevitas, INT4)
+## 5. Physical nuScenes verification and live demonstration
 
-The network is a compact U-Net-style encoder/decoder, quantized end-to-end
-with **Brevitas** (quantization-aware training) so it stays small enough for
-FINN to synthesize.
+The runner interleaves input writes and output reads through bounded queues. Reusing JTAG transaction objects reduced a measured register-read operation from about 75 ms to 44 ms in a 20-read microbenchmark. The live viewer uses transferred words and captured bytes to reveal completed rows. It shows the density channel, output mask and label overlay; green marks true positives, red false positives and blue false negatives. A separate replay mode supports rehearsal.
 
-Key settings:
+Each physical capture was checked against the matching software byte stream. A second comparison scores the thresholded mask against labels. Strict IoU is TP / (TP + FP + FN), using label > 0. IoU_d2 applies an additional 5 × 5 square dilation to that target before calculating overlap. All counts below are **BEV cells**.
 
-| Setting | Value |
+| Real frame | Precision | TP | FP | FN | Strict IoU | IoU_d2 | F1 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 01 · scene 0002 | INT4 | 883 | 1,129 | 60 | 0.426158 | 0.340954 | 0.597631 |
+| 01 · scene 0002 | INT8 | 876 | 1,297 | 67 | 0.391071 | 0.337198 | 0.562259 |
+| 02 · scene 0042 | INT4 | 0 | 351 | 0 | 0 | 0 | 0 |
+| 02 · scene 0042 | INT8 | 0 | 501 | 0 | 0 | 0 | 0 |
+| 03 · scene 0043 | INT4 | 61 | 436 | 0 | 0.122736 | 0.166096 | 0.218638 |
+| 03 · scene 0043 | INT8 | 61 | 395 | 0 | 0.133772 | 0.216730 | 0.235977 |
+
+Frame 01 favors INT4 on both missed and false-positive cells. Frame 02 contains zero labeled positives and both models produce false positives. On frame 03 both recover all 61 positives, while INT8 produces 41 fewer false-positive cells. The additional reference fixture has no labels and therefore contributes only to byte verification. Across the four inputs and two precisions, all **524,288 captured output bytes** matched. These three labeled frames establish case-level behavior; dataset-level accuracy requires the held-out evaluation.
+
+## 6. Frozen-model portability across LiDAR datasets
+
+Can the same trained model process a different sensor’s data after adapting the input? This experiment freezes the KITTI weights, decision rules and manual dual-network bitstream. A nuScenes adapter decodes the five-float point records, rotates points by the recorded calibration and applies the original KITTI rasterizer, normalization, precision-specific quantization and packing. Both datasets then enter the same 128 × 128 hardware interface: 16,384 pixel words in and 512 binary mask words out.
+
+The aligned evaluation uses Car/Truck footprints within a front-view visibility proxy. KITTI Van and DontCare regions are excluded. Annotation conventions and the ground-plane visibility approximation still affect interpretation.
+
+| Software engineering pilot | Frames | INT4 micro IoU | INT8 micro IoU |
+|---|---:|---:|---:|
+| KITTI controls | 3 | 0.193878 | 0.194444 |
+| nuScenes examples | 3 | 0.173285 | 0.141079 |
+
+Micro IoU sums TP, FP and FN across the three frames before division. Four original fixture checks reproduced the packed input words. Twelve case/precision checks verified model identity and packing. The full comparison has pinned cohorts of 1,123 KITTI frames and 991 nuScenes frames across 25 scenes. Its accuracy drop and the twelve physical pilot captures remain open. KITTI uses the original frame-level split, so sequence independence remains unestablished. [Portability audit](BHAIYA_REQUIREMENTS_AUDIT.md)
+
+## 7. Shared INT4/INT8 engine for the larger nuScenes models
+
+The shared engine reuses the previously trained weights. It computes eleven convolutions on one 16-lane datapath, with pooling, upsampling, two activation buffers and a reloadable weight bank. A 52 × 52 input tile yields a 16 × 16 output region. Tile scheduling preserves receptive fields, pooling phase and boundary padding. The engine buffers a stripe and exposes it for readback.
+
+```mermaid
+flowchart LR
+    A["Host measures occupied and isolated input cells"] --> B["Dual RV32I controller applies hysteresis"]
+    B --> C["Select next frame profile"]
+    C --> D["Host loads weights when required"]
+    D --> E["Check profile CRC and latch frame mode"]
+    E --> F["Shared 16-lane convolution datapath"]
+    F --> G["Drain stripes and verify full output"]
+```
+
+The firmware selects INT4 below score 32 and INT8 at or above 64. Intermediate scores retain the previous selection. A frame keeps its committed precision until completion. This is host-assisted switching between frames using one FPGA image. Both precisions follow the same lane schedule. The accuracy benefit of the selection policy remains to be evaluated.
+
+| Shared-engine check | Recorded outcome |
 |---|---|
-| Input channels | 3 |
-| Base channels | 16 |
-| Weight bit-width | 4 (`Int4WeightPerTensorFloatDecoupled`) |
-| Activation bit-width | 4/8 (`Int8ActPerTensorFixedPoint`) |
-| Framework | PyTorch + Brevitas |
+| Full-frame RTL simulation | 8 outputs matched exactly, 128 stripe checks and 4 mode-transition tests |
+| Host protocol | 10 mocked runs, including directed selection and density-driven selection |
+| Routed target | XC7Z010CLG400-1 at 35 MHz, setup slack +4.192 ns, hold slack +0.015 ns |
+| Resources | 9,357 LUTs, 51.5 BRAM tiles, 0 DSPs |
+| Compute schedule | 523,450,824 tile-compute cycles per frame in RTL, approximately 14.96 s at 35 MHz |
+| Physical validation | 10-run Zybo sweep prepared; physical captures pending |
 
-### 4.1 TinyUNetQ architecture flow (skip connections removed)
+The RTL cycle figure covers the compute schedule. Historical viewer times also include JTAG transfer and host work. Neither measurement establishes automotive real-time throughput. [Architecture](nuscenes_dynamic/ARCHITECTURE.md) · [Release acceptance and checksums](nuscenes_dynamic/release/acceptance.json)
 
-```
-Input  (3 × 300 × 300)
-        │
-        ▼
-  QuantIdentity  (input quant, 4-bit)
-        │
-        ▼
-┌────────────────────┐
-│ Encoder Block 1 (e1)│  Conv(3→16) → ReLU → Conv(16→16) → ReLU
-└──────────┬──────────┘
-           ▼
-      MaxPool2d (p1)
-           │
-           ▼
-┌────────────────────┐
-│ Encoder Block 2 (e2)│  Conv(16→32) → ReLU → Conv(32→32) → ReLU
-└──────────┬──────────┘
-           ▼
-      MaxPool2d (p2)
-           │
-           ▼
-┌────────────────────┐
-│   Bottleneck (b)    │  Conv(32→64) → ReLU → Conv(64→64) → ReLU
-└──────────┬──────────┘
-           ▼
- ConvTranspose2d u2 (64→32)
-           │
-           ▼             ✗ torch.cat([d2, e2])  REMOVED for FINN
-┌────────────────────┐
-│ Decoder Block 2 (d2)│  Conv(32→32) → ReLU
-└──────────┬──────────┘
-           ▼
- ConvTranspose2d u1 (32→16)
-           │
-           ▼             ✗ torch.cat([d1, e1])  REMOVED for FINN
-┌────────────────────┐
-│ Decoder Block 1 (d1)│  Conv(16→16) → ReLU
-└──────────┬──────────┘
-           ▼
-   QuantConv2d out (16→1, 1×1)
-           │
-           ▼
-   Output (1 × 300 × 300)
+## Reproduce the checks
+
+Start from the extracted sweep kit or this project root with both suite directories present. The supplied Windows launcher uses Vivado 2023.2 and a configured Python executable. On another workstation, update the two executable paths at the top of the launcher. Raw dataset evaluation additionally requires the datasets and their metadata at the configured locations.
+
+**Offline checks** validate the prepared inputs and release artifacts without opening JTAG.
+
+```powershell
+.\RUN_ZYBO_SWEEPS.ps1 -Suite Both
 ```
 
-**FINN-compatibility change:** skip connections (`torch.cat([...])` between
-encoder and decoder blocks) were **removed**, and the corresponding decoder
-conv input channels were updated accordingly (e.g. `base*4 → base*2` became
-`base*2 → base*2`), since FINN's dataflow build does not support the
-original concat-based skip connections in this step of the project.
+**Physical checks** are user-initiated. With the legacy Zybo connected and its JTAG target released by other sessions, the following command programs the board and runs both suites.
 
-Layers used: `QuantConv2d`, `QuantConvTranspose2d`, `QuantReLU`,
-`QuantIdentity`, with `return_quant_tensor=True` (required for FINN tracing).
-`nn.MaxPool2d` is currently used (guide recommends `QuantMaxPool2d` — flagged
-for review, not yet resolved).
+```powershell
+.\RUN_ZYBO_SWEEPS.ps1 -Suite Both -ProgramZybo
+```
 
----
+A successful future run should emit `PORTABILITY_SWEEP_PASS captures=12` and `DYNAMIC_SWEEP_PASS captures=10`, followed by the combined summary path. Preserve the timestamped run logs, raw captures, mode observations, checker outputs and hashes. The [Zybo run guide](ZYBO_RUN_GUIDE.md) includes the Vivado Tcl alternative and per-suite instructions.
 
-## 5. Quantization background
+## Explore the implementation
 
-| Precision | Bits | Hardware cost | Typical accuracy |
-|---|---|---|---|
-| FP32 | 32 | Highest | Baseline |
-| INT8 | 8 | Lower | Usually close to FP32 |
-| INT4 | 4 | Very low | Needs verification |
-
-Goal: find the **lowest bit-width that still gives acceptable accuracy**
-while producing an efficient FPGA implementation. Low-bit values (e.g. 4-bit
-× 4-bit multiplications) require much simpler FPGA logic than floating point,
-which is why FINN is attractive for this project.
-
----
-
-## 6. Evaluation results
-
-### Segmentation metrics (earlier checkpoint)
-
-| Metric | Value |
+| Entry point | What to inspect |
 |---|---|
-| PR-AUC | 0.7017 |
-| ROC-AUC | 0.9914 |
-| Best F1 | 0.6527 (threshold ≈ 0.8436) |
-| Precision @ best F1 | 0.6460 |
-| Recall @ best F1 | 0.6595 |
+| [Engineering history](overview_content.md) | Dated record of the earlier KITTI work, local training, compiler decisions and fixed nuScenes board preparation |
+| [Historical FINN manual](historical_finn_manual_20261020/FINN_AND_ZYBO_MANUAL.md) | Original model conversion workflow and numerical gates |
+| [Frozen KITTI portability study](portability_study/) | Dataset adapter, frozen release, case manifests, independent checker and pilot reports |
+| [Shared engine RTL](nuscenes_dynamic/rtl/) | Tile compute, memory, register interface, frame control and RISC-V integration |
+| [Full-frame simulation](nuscenes_dynamic/sim/) | AXI simulation and host protocol tests |
+| [Routed release](nuscenes_dynamic/release/) | Bitstream, debug probes and checksum-pinned acceptance record |
+| [Sweep launcher](RUN_ZYBO_SWEEPS.ps1) | Offline preflight and explicit hardware entry points |
 
-### Old (with skip connections) vs New (FINN-compatible, no skip connections)
-
-| Metric | Old | New | Change |
-|---|---|---|---|
-| Params | 105,491 | 86,295 | −18.20% |
-| Loss | 0.0169 | 0.0247 | +0.0078 |
-| Accuracy | 0.9934 | 0.9904 | −0.0031 |
-| IoU | 0.4091 | 0.3253 | −0.0839 |
-| Precision | 0.4495 | 0.3469 | −0.1026 |
-| Recall | 0.8201 | 0.8390 | +0.0190 |
-| F1 | 0.5807 | 0.4909 | −0.0898 |
-
-Removing the skip connections reduced parameter count but also reduced
-segmentation quality — a known trade-off accepted for FINN compatibility.
-
----
-
-## 7. Environment setup (Windows → VirtualBox → Ubuntu → Docker → FINN)
-
-### 7.1 Machine setup
-1. Install **VirtualBox 7.2.14** on Windows.
-2. Create an Ubuntu VM.
-   - Enable **Nested VT-x/AMD-V** in VM settings (Settings → System →
-     Acceleration) — this option is greyed out unless virtualization is
-     enabled in the **BIOS/UEFI** first (Intel VT-x / AMD-V), and in some
-     cases unless the VM is powered off and hardware virtualization is
-     confirmed available via `systeminfo` (Windows) showing
-     "Virtualization Enabled in Firmware: Yes".
-   - Set VM disk size to **150–200 GB** (FINN + Docker images are large).
-3. Enable **Shared Clipboard**: VM window → **Devices → Shared Clipboard →
-   Bidirectional** (VM must be running; Guest Additions must be installed
-   for this option to be selectable).
-4. Open a terminal in Ubuntu: **Activities → search "Terminal"**, or
-   right-click Desktop → **Open Terminal**, or `Ctrl+Alt+T`.
-
-### 7.2 One-time setup (already completed)
-- Ubuntu installation
-- Docker installation
-- FINN Docker image pulled (~8.7 GB)
-- FINN v0.9 cloned (`~/finn_ws/finn`)
-- FINN dependencies installed (`qonnx`, `brevitas`, etc.)
-- `run-docker-safe.sh` script created
-
-### 7.3 Every time you want to work on FINN
-
-```bash
-# 1. Start the Ubuntu VM in VirtualBox
-# 2. Open a terminal
-cd ~/finn_ws/finn
-bash run-docker-safe.sh
-```
-
-You'll land inside the FINN container:
-
-```
-root@pavitinder-VirtualBox:/workspace#
-```
-
-To leave the container (without destroying your work — files inside the
-mounted project folder persist):
-
-```bash
-exit
-```
-
-Then you can safely close the Ubuntu VM / VirtualBox window.
-
-**You do NOT need to repeat:** Ubuntu install, Docker install, FINN image
-pull, FINN clone, or `fetch-repos.sh`. Those are one-time steps only.
-
-### 7.4 Startup workflow (visual)
-
-```
- Windows (host)
-      │
-      ▼
- VirtualBox 7.2.14
-      │
-      ▼
- Ubuntu VM   ── one-time only: Docker install, FINN clone, fetch-repos.sh
-      │
-      ▼
- Terminal →  cd ~/finn_ws/finn
-      │
-      ▼
- Terminal →  bash run-docker-safe.sh
-      │
-      ▼
- FINN Docker container
- root@pavitinder-VirtualBox:/workspace#   ← WORK HAPPENS HERE
-      │
-      ▼
-      exit
-      │
-      ▼
- Back in Ubuntu → close the VM
-```
-
-### 7.5 Vivado note
-Vivado is installed on **Windows**, not inside the Ubuntu FINN container.
-The FINN guide's early steps (through model conversion / transformation) do
-not require Vivado — it is only needed later, for synthesis, implementation,
-and bitstream generation. A "Vivado not available" warning inside the FINN
-container is expected until that stage is reached and Vivado is mounted /
-made accessible to the container.
-
----
-
-## 8. Project file locations
-
-```
-D:\Segmentation Project\
-│
-├── training\
-│   ├── image_2\
-│   ├── label_2\
-│   └── velodyne\
-├── testing\
-│   ├── image_2\
-│   └── velodyne\
-└── bev_outputs\
-    └── bev_outputs_4bit\
-        ├── tiny_bev_halo_qat_int4.pt
-        ├── tiny_bev_halo_qat_int4_finn.pt
-        ├── tiny_bev_halo_qat_int4_finn_qonnx.onnx
-        └── dataset_3ch_halo\test\
-
-C:\Users\DELL\OpenPCDet\data\kitti\training      (alternate dataset copy)
-D:\Data\essentials\Thapar\MTech\Projects\Main proj\   (run/output dir)
-```
-
-Inside the Ubuntu FINN Docker container:
-
-```
-/workspace/workspace/my_project/
-    ├── build.py
-    ├── tiny_bev_halo_qat_int4_finn.pt
-    ├── tiny_bev_halo_qat_int4_finn_qonnx.onnx
-    └── build_log.txt
-```
-
-File transfer path: **Windows → VirtualBox Shared Folder
-(`/media/sf_shared`) → Ubuntu → copied into the FINN project workspace.**
-
----
-
-## 9. FINN build configuration
-
-```python
-FPGA_PART = "xc7z010clg400-1"   # Zybo Z7-10
-CLOCK_NS  = 10.0
-FOLDING_CONFIG = None            # default folding for first build
-shell_flow_type = ShellFlowType.VIVADO_ZYNQ
-```
-
-Note: the guide originally referenced `ShellFlowType.ZYNQ_IPI`, which does
-not exist in the installed FINN version. The installed FINN exposes
-`VIVADO_ZYNQ` and `VITIS_ALVEO`, so `VIVADO_ZYNQ` was used for the Zynq-based
-Zybo Z7-10 target — this is an adaptation to the installed FINN version, not
-a deviation from the guide's intent.
-
----
-
-## 10. Progress checklist
-
-| Stage | Status |
-|---|---|
-| KITTI dataset prepared | ✅ Done |
-| LiDAR → BEV processing | ✅ Done |
-| BEV dataset generation (7,481 frames) | ✅ Done |
-| Dataset splitting | ✅ Done |
-| TinyUNetQ (INT4) model built | ✅ Done |
-| Skip connections removed (FINN Step 1) | ✅ Done |
-| Quantization compatibility check (Step 1.3) | ✅ Done |
-| Model training | ✅ Done |
-| Model evaluation (old vs new) | ✅ Done |
-| QONNX / ONNX export | ✅ Done |
-| Windows → Ubuntu file transfer | ✅ Done |
-| FINN Docker environment set up | ✅ Done |
-| QONNX model loads in FINN (47 nodes) | ✅ Done |
-| PyVerilator / RTL sim import fixed | ✅ Done |
-| `build.py` written, Zybo Z7-10 target set | ✅ Done |
-| `ShellFlowType.ZYNQ_IPI` → `VIVADO_ZYNQ` fix | ✅ Done |
-| FINN model conversion (`step_qonnx_to_finn`) | ❌ **Blocked (current issue)** |
-| HLS synthesis | ⏸️ Not reached |
-| IP stitching | ⏸️ Not reached |
-| Vivado synthesis / implementation | ⏸️ Not reached |
-| Bitstream generation | ⏸️ Not reached |
-| FPGA testing | ⏸️ Not reached |
-
-### 10.1 Roadmap at a glance
-
-```
-✅ KITTI dataset prepared
-✅ LiDAR → BEV pipeline
-✅ BEV dataset generated (7,481 frames)
-✅ TinyUNetQ (INT4) built & trained
-✅ Skip connections removed (FINN Step 1)
-✅ Model evaluated (old vs new)
-✅ QONNX / ONNX exported
-✅ FINN Docker environment ready
-✅ build.py written (Zybo Z7-10 target)
-        │
-        ▼
-❌ step_qonnx_to_finn   ← CURRENT BLOCKER
-        │
-        ▼
-⏸ HLS synthesis
-⏸ IP stitching
-⏸ Vivado synthesis / implementation
-⏸ Bitstream generation
-⏸ FPGA testing (Zybo Z7-10)
-```
-
----
-
-## 11. Current blocker
-
-**Step:** `step_qonnx_to_finn [1/17]` (the very first FINN transformation
-step, before folding, HLS, or Vivado).
-
-**Error:**
-```
-ValueError: FINN only supports unsigned and non-narrow Quant nodes for Relu activations.
-```
-
-**Meaning:** FINN's early transformation stage found a `Quant` node feeding
-a `Relu` that is configured as **signed and/or narrow-range**, which FINN
-does not support for ReLU activations. FINN expects an **unsigned**
-activation quantizer (the guide's reference example uses
-`Uint8ActPerTensorFixedPoint`) for these positions.
-
-### 11.1 FINN build flow — where the block is
-
-```
-tiny_bev_halo_qat_int4_finn_qonnx.onnx   (47 nodes)
-        │
-        ▼
-[1/17] step_qonnx_to_finn        ❌ FAILS HERE
-        │                          "FINN only supports unsigned and
-        │                           non-narrow Quant nodes for Relu"
-        ▼
-[2/17] step_streamline           ⏸ not reached
-        ▼
-[3/17] step_convert_to_hw        ⏸ not reached
-        ▼
-  ...  folding, HLS codegen,
-       IP stitching, etc.        ⏸ not reached
-        ▼
-[17/17] step_deployment_package  ⏸ not reached
-        │
-        ▼
-   Vivado synthesis / implementation   ⏸ not reached
-        │
-        ▼
-   Bitstream → Zybo Z7-10              ⏸ not reached
-```
-
-### 11.2 Debug decision flow
-
-```
-        Build fails at step_qonnx_to_finn
-                     │
-                     ▼
-     Inspect QONNX graph (Quant + Relu nodes)
-                     │
-                     ▼
-      Find node(s) with signed / narrow Quant
-                     │
-                     ▼
-     Is it feeding a QuantReLU activation?
-          │                        │
-         Yes                       No
-          │                        │
-          ▼                        ▼
- Switch that activation      Investigate further —
- quantizer to an UNSIGNED    a different node type
- quantizer (e.g.             may be causing the
- Uint8ActPerTensorFixedPoint) error
-          │
-          ▼
-   Re-export QONNX
-          │
-          ▼
- Re-run step_qonnx_to_finn ONLY
- (not the full build)
-          │
-          ▼
-      Passes? ──No──► repeat inspection
-          │
-         Yes
-          │
-          ▼
- Continue to step 2/17 onward
-```
-
-**Current investigation step:** inspect the exported ONNX graph to find the
-exact `Quant`/`Relu` node(s) responsible, before making any changes to the
-model or `build.py`:
-
-```bash
-python3 - << 'EOF'
-from qonnx.core.modelwrapper import ModelWrapper
-
-model = ModelWrapper(
-    "/workspace/workspace/my_project/tiny_bev_halo_qat_int4_finn_qonnx.onnx"
-)
-
-print("=== QUANTIZATION NODES ===")
-for node in model.graph.node:
-    if "Quant" in node.op_type or node.op_type in ["Relu", "Quant"]:
-        print()
-        print("Node name :", node.name)
-        print("Op type   :", node.op_type)
-        print("Inputs    :", list(node.input))
-        print("Outputs   :", list(node.output))
-        for attr in node.attribute:
-            print("Attribute :", attr.name, "=", attr)
-EOF
-```
-
-**Do not** run `python3 build.py` again until this is resolved — it will
-fail at the same step and re-trigger the same long-running attempt.
-
----
-
-## 12. Next steps (in order)
-
-1. Inspect the QONNX graph's `Quant`/`Relu` nodes (command above).
-2. Identify which activation quantizer(s) are signed/narrow and need to
-   become unsigned (likely switching relevant `QuantReLU` activation
-   quantizers toward an unsigned fixed-point quantizer, consistent with the
-   guide's reference configuration).
-3. Re-export QONNX after the fix and re-verify node count/shapes.
-4. Re-run `step_qonnx_to_finn` only (not the full multi-hour build) to
-   confirm the fix.
-5. Continue strictly through the guide's remaining FINN steps in order:
-   Streamline → Lowering → Cleanup → Folding → HLS synthesis → IP stitching
-   → weight verification → Vivado block design → synthesis/implementation →
-   bitstream → deploy to Zybo Z7-10.
-6. After a successful first build, tune folding (PE/SIMD) for
-   resource/performance trade-offs — not before.
-
----
-
-## 13. Debugging philosophy for this project
-
-At every stage, confirm the output makes sense **before** moving to the
-next stage:
-
-| Stage | What to check |
-|---|---|
-| BEV generation | shape, min/max, non-zero pixel count, visualization |
-| Model training | loss, F1, IoU, precision, recall |
-| Quantization | bit-width, accuracy degradation vs FP32 |
-| ONNX/QONNX export | graph structure, input/output shapes, operators |
-| FINN | graph transformations, datatypes, folding, build logs |
-| FPGA | bitstream validity, runtime output, latency, resource usage |
-
-This avoids debugging multiple systems (model, export, FINN, Vivado) at the
-same time.
-
----
-
-## 14. Glossary (quick reference)
-
-- **BEV** — Bird's-Eye View; top-down 2D projection of a 3D LiDAR point cloud.
-- **Brevitas** — PyTorch library for quantization-aware training.
-- **ONNX** — standardized neural-network graph format.
-- **QONNX** — ONNX variant that represents arbitrary-precision quantized
-  networks; FINN's intermediate representation.
-- **FINN** — Xilinx/AMD framework that compiles quantized neural networks
-  into FPGA dataflow accelerators.
-- **Dataflow architecture** — hardware pipeline where each layer is a
-  dedicated, parallel processing block, rather than sequential CPU
-  instructions.
-- **LUT / FF / BRAM / DSP** — FPGA hardware resources (logic, registers,
-  on-chip memory, arithmetic blocks) tracked when evaluating a build.
+The project demonstrates a reproducible path from quantized model to physical capture on a resource-constrained FPGA. Current research questions are how much accuracy a frozen model retains across sensors under aligned evaluation, and whether frame-level precision selection improves the accuracy–cost trade-off. The prepared experiments keep these questions independently testable.
